@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: MIT
 
 //! Defines idempotency middleware for the Axum server which first looks up the given key for an
-//! existing response before routing to the given endpoint's function, and caches any such results
+//! existing response before routing to the given endpoint's function, and stores any such results
 //! such that subsequent requests to that endpoint with the same key will return the same response.
 //!
-//! Responses are cached for twelve hours by default.
+//! Responses are stored for twelve hours by default.
 
 use std::{collections::HashMap, convert::Infallible, future::Future, pin::Pin, time::Duration};
 
@@ -21,10 +21,11 @@ use http::request::Parts;
 use serde::{Deserialize, Serialize};
 use tower::Service;
 
-use super::cache::{kv_def, Cache, CacheBehavior, CacheKey, CacheValue};
+use super::kv_backend::{kv_def, Key, KvBackend, Value};
+use super::shared_store::SharedStore;
 use crate::error::Error;
 
-/// Returns the default exipry period for cached responses
+/// Returns the default exipry period for stored responses
 const fn expiry_default() -> Duration {
     Duration::from_secs(60 * 60 * 12)
 }
@@ -35,13 +36,13 @@ const fn expiry_starting() -> Duration {
 }
 
 /// Returns the duration to sleep before retrying to find a [`SerializedResponse::Finished`] in the
-/// cache
+/// store
 const fn wait_duration() -> Duration {
     Duration::from_millis(200)
 }
 
 /// The data structure containing all necessary components of a response ready to be (de)serialized
-/// from/into the cache
+/// from/into the store
 #[derive(Deserialize, Serialize)]
 enum SerializedResponse {
     Start,
@@ -118,7 +119,7 @@ where
 /// The idempotency middleware itself -- used via the [`Router::layer`] method
 #[derive(Clone)]
 pub struct IdempotencyService<S: Clone> {
-    pub cache: Cache,
+    pub store: SharedStore,
     pub service: S,
 }
 
@@ -141,9 +142,9 @@ where
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let mut service = self.service.clone();
-        let cache = self.cache.clone();
+        let store = self.store.clone();
 
-        if !cache.is_none() {
+        if !store.is_none() {
             Box::pin(async move {
                 let (parts, body) = req.into_parts();
 
@@ -160,9 +161,9 @@ where
                     return resolve_service(service, Request::from_parts(parts, body)).await;
                 };
 
-                // Set the [`SerializedResponse::Start`] lock if the key does not exist in the cache
+                // Set the [`SerializedResponse::Start`] lock if the key does not exist in the store
                 // returning whether the value was set
-                let lock_acquired = if let Ok(lock_acquired) = cache
+                let lock_acquired = if let Ok(lock_acquired) = store
                     .set_if_not_exists(&key, &SerializedResponse::Start, expiry_starting())
                     .await
                 {
@@ -171,15 +172,15 @@ where
                     return Ok(StatusCode::INTERNAL_SERVER_ERROR.into_response());
                 };
 
-                // If the lock was not set, first check the cache for a `Finished` cache value. If
+                // If the lock was not set, first check the store for a `Finished` store value. If
                 // it is instead `None` or the value is a `Start` lock, then enter a loop checking
                 // it every 200ms.
                 //
                 // If the loop times out, then reset the lock and proceed to resolve the service.
                 //
-                // If at any point the cache returns an `Err`, then return 500 response
+                // If at any point the store returns an `Err`, then return 500 response
                 if !lock_acquired {
-                    match cache.get::<SerializedResponse>(&key).await {
+                    match store.get::<SerializedResponse>(&key).await {
                         Ok(Some(SerializedResponse::Finished {
                             code,
                             headers,
@@ -196,7 +197,7 @@ where
                                 code,
                                 headers,
                                 body,
-                            })) = lock_loop(&cache, &key).await
+                            })) = lock_loop(&store, &key).await
                             {
                                 return Ok(finished_serialized_response_to_reponse(
                                     code, headers, body,
@@ -208,7 +209,7 @@ where
                                 // Set the lock if it returns `Ok(None)` and continue to resolve
                                 // as normal, but return 500 if the lock cannot be set
                                 if !matches!(
-                                    cache
+                                    store
                                         .set_if_not_exists(
                                             &key,
                                             &SerializedResponse::Start,
@@ -229,7 +230,7 @@ where
                 // If it's set or the lock or the `lock_loop` returns Ok(None), then the key has no
                 // value, so continue resolving the service while caching the response for 2xx
                 // responses
-                resolve_and_cache_response(&cache, &key, service, Request::from_parts(parts, body))
+                resolve_and_store_response(&store, &key, service, Request::from_parts(parts, body))
                     .await
             })
         } else {
@@ -244,14 +245,14 @@ fn get_key(parts: &Parts) -> Option<IdempotencyKey> {
     let key = if let Some(Ok(key)) = parts.headers.get("idempotency-key").map(|v| v.to_str()) {
         key
     } else {
-        // No idempotency-key -- pass off to service and do not cache
+        // No idempotency-key -- pass off to service and do not store
         return None;
     };
 
     let auth = if let Some(Ok(auth)) = parts.headers.get("Authorization").map(|v| v.to_str()) {
         auth
     } else {
-        // No auth token -- pass off to service and do not cache
+        // No auth token -- pass off to service and do not store
         return None;
     };
 
@@ -263,7 +264,7 @@ fn get_key(parts: &Parts) -> Option<IdempotencyKey> {
 /// If the lock could not be set, then another request with that key has been completed or is being
 /// completed, so loop until it has been completed or times out
 async fn lock_loop(
-    cache: &Cache,
+    store: &SharedStore,
     key: &IdempotencyKey,
 ) -> Result<Option<SerializedResponse>, Error> {
     let mut total_delay_duration = std::time::Duration::from_millis(0);
@@ -272,8 +273,8 @@ async fn lock_loop(
         total_delay_duration += wait_duration();
         tokio::time::sleep(wait_duration()).await;
 
-        match cache.get::<SerializedResponse>(key).await {
-            // Value has been retreived from cache, so return it
+        match store.get::<SerializedResponse>(key).await {
+            // Value has been retreived from store, so return it
             Ok(Some(resp @ SerializedResponse::Finished { .. })) => return Ok(Some(resp)),
 
             // Request setting the lock has not been resolved yet, so wait a little and loop again
@@ -292,8 +293,8 @@ async fn lock_loop(
 }
 
 /// Resolves the service and chaches the result assuming the response is successful
-async fn resolve_and_cache_response<S>(
-    cache: &Cache,
+async fn resolve_and_store_response<S>(
+    store: &SharedStore,
     key: &IdempotencyKey,
     service: S,
     request: Request<Body>,
@@ -309,7 +310,7 @@ where
         .unwrap()
         .into_parts();
 
-    // If a 2xx response, cache the actual response
+    // If a 2xx response, store the actual response
     if parts.status.is_success() {
         // TODO: Don't skip over Err value
         let bytes = body.data().await.and_then(Result::ok);
@@ -326,7 +327,7 @@ where
             body: bytes.clone().map(|b| b.to_vec()),
         };
 
-        if cache.set(key, &resp, expiry_default()).await.is_err() {
+        if store.set(key, &resp, expiry_default()).await.is_err() {
             return Ok(StatusCode::INTERNAL_SERVER_ERROR.into_response());
         }
 
@@ -336,7 +337,7 @@ where
     }
     // If any other status, unset the start lock and return the response
     else {
-        if cache.delete(key).await.is_err() {
+        if store.delete(key).await.is_err() {
             return Ok(StatusCode::INTERNAL_SERVER_ERROR.into_response());
         }
 
@@ -356,8 +357,9 @@ mod tests {
 
     use super::IdempotencyService;
     use crate::core::{
-        cache,
+        kv_backend::memory::MemoryKv,
         security::generate_org_token,
+        shared_store::SharedStore,
         types::{BaseId, OrganizationId},
     };
 
@@ -375,7 +377,7 @@ mod tests {
     ) -> (JoinHandle<()>, String, Arc<Mutex<usize>>) {
         dotenv::dotenv().ok();
 
-        let cache = cache::memory::new();
+        let store = SharedStore::MemorySharedStore(MemoryKv::new());
 
         let count = Arc::new(Mutex::new(0));
 
@@ -392,7 +394,7 @@ mod tests {
                             .route("/", post(service_endpoint).get(service_endpoint))
                             .layer(
                                 ServiceBuilder::new().layer_fn(|service| IdempotencyService {
-                                    cache: cache.clone(),
+                                    store: store.clone(),
                                     service,
                                 }),
                             )
@@ -576,7 +578,7 @@ mod tests {
     async fn start_empty_service() -> (JoinHandle<()>, String, Arc<Mutex<u16>>) {
         dotenv::dotenv().ok();
 
-        let cache = cache::memory::new();
+        let store = SharedStore::MemorySharedStore(MemoryKv::new());
 
         let count = Arc::new(Mutex::new(199));
 
@@ -593,7 +595,7 @@ mod tests {
                             .route("/", post(empty_service_endpoint))
                             .layer(
                                 ServiceBuilder::new().layer_fn(|service| IdempotencyService {
-                                    cache: cache.clone(),
+                                    store: store.clone(),
                                     service,
                                 }),
                             )

@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     core::{
-        cache::{kv_def, Cache, CacheBehavior, CacheKey, CacheValue},
+        cache::Cache,
+        kv_backend::{kv_def, Key, KvBackend, Value},
         types::{
             ApplicationId, ApplicationUid, EndpointHeaders, EndpointId, EndpointSecretInternal,
             EventChannelSet, EventTypeNameSet, ExpiringSigningKeys, MessageAttemptTriggerType,
@@ -181,11 +182,11 @@ impl TryFrom<endpoint::Model> for CreateMessageEndpoint {
     }
 }
 
-kv_def!(AppEndpointKey, CreateMessageApp);
+kv_def!(AppEndpointKey, CreateMessageApp, "SVIX_CACHE_APP_v3");
 impl AppEndpointKey {
     // FIXME: Rewrite doc comment when AppEndpointValue members are known
     /// Returns a key for fetching all cached endpoints for a given organization and application.
     pub fn new(org: OrganizationId, app: ApplicationId) -> AppEndpointKey {
-        AppEndpointKey(format!("{}_APP_v3_{}_{}", Self::PREFIX_CACHE, org, app))
+        AppEndpointKey(format!("{}_APP_v3_{}_{}", Self::KEY_PREFIX, org, app))
     }
 }

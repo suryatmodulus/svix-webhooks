@@ -10,11 +10,18 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use crate::core::run_with_retries::run_with_retries;
 
-pub mod memory;
-pub mod none;
-pub mod redis;
+use super::cache::Cache;
 
-/// Errors internal to the cache
+pub mod memory;
+use memory::MemoryKv;
+
+pub mod none;
+use none::NoKvBackend;
+
+pub mod redis;
+use self::redis::RedisKv;
+
+/// Errors internal to the KV Backends
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("error deserializing Redis value")]
@@ -35,26 +42,27 @@ pub enum Error {
     #[error("input error: {0}")]
     Input(String),
 }
-type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = std::result::Result<T, Error>;
 
-/// A valid key value for the cache -- usually just a wrapper around a [`String`]
-pub trait CacheKey: AsRef<str> + Send + Sync {
-    const PREFIX_CACHE: &'static str = "SVIX_CACHE";
+/// A valid key value for the shared_store -- usually just a wrapper around a [`String`]
+pub trait Key: AsRef<str> + Send + Sync {
+    const KEY_PREFIX: &'static str;
 }
-/// Any (de)serializable structure usuable as a value in the cache -- it is associated with a
-/// given key type to ensure type checking on creation or reading of values from the cache
-pub trait CacheValue: DeserializeOwned + Serialize + Send + Sync {
-    type Key: CacheKey;
-}
-
-pub trait StringCacheValue: ToString + TryFrom<String> + Send + Sync {
-    type Key: CacheKey;
+/// Any (de)serializable structure usuable as a value in the shared_store or cache -- it is
+/// associated with a given key type to ensure type checking on creation or reading of values from
+///  the shared_store
+pub trait Value: DeserializeOwned + Serialize + Send + Sync {
+    type Key: Key;
 }
 
-/// An inner macro which defines everything common to the below macro. Not really meant to be used,
-/// but it can't be made private or else it couldn't be used in the outer macro.
-macro_rules! kv_def_inner {
-    ($key_id:ident, $val_struct:ident) => {
+pub trait StringValue: ToString + TryFrom<String> + Send + Sync {
+    type Key: Key;
+}
+
+/// A macro that creates a [`Key`] and ties it to any value that implements [`DeserializeOwned`] and
+/// [`Serialize`]
+macro_rules! kv_def {
+    ($key_id:ident, $val_struct:ident, $lit_prefix:literal) => {
         #[derive(Clone, Debug)]
         pub struct $key_id(String);
 
@@ -64,87 +72,41 @@ macro_rules! kv_def_inner {
             }
         }
 
-        impl CacheValue for $val_struct {
+        impl Value for $val_struct {
             type Key = $key_id;
         }
-    };
-}
-pub(crate) use kv_def_inner;
 
-/// A macro that creates a [`CacheKey`] and ties it to any value that implements
-/// [`DeserializeOwned`] and [`Serialize`]
-macro_rules! kv_def {
-    ($key_id:ident, $val_struct:ident, $lit_prefix:literal) => {
-        crate::core::cache::kv_def_inner!($key_id, $val_struct);
-
-        impl CacheKey for $key_id {
-            const PREFIX_CACHE: &'static str = $lit_prefix;
+        impl Key for $key_id {
+            const KEY_PREFIX: &'static str = $lit_prefix;
         }
-    };
-
-    ($key_id:ident, $val_struct:ident) => {
-        crate::core::cache::kv_def_inner!($key_id, $val_struct);
-
-        impl CacheKey for $key_id {}
     };
 }
 pub(crate) use kv_def;
-
-/// An inner macro which defines everything common to the below macro. Not really meant to be used,
-/// but it can't be made private or else it couldn't be used in the outer macro.
-#[allow(unused_macros)]
-macro_rules! string_kv_def_inner {
-    ($key_id:ident, $val_struct:ident) => {
-        #[derive(Clone, Debug)]
-        pub struct $key_id(String);
-
-        impl AsRef<str> for $key_id {
-            fn as_ref(&self) -> &str {
-                &self.0
-            }
-        }
-
-        impl StringCacheValue for $val_struct {
-            type Key = $key_id;
-        }
-    };
-}
-#[allow(unused_imports)]
-pub(crate) use string_kv_def_inner;
 
 // Used downstream and for testing:
 #[allow(unused_macros)]
 macro_rules! string_kv_def {
     ($key_id:ident, $val_struct:ident, $lit_prefix:literal) => {
-        crate::core::cache::string_kv_def_inner!($key_id, $val_struct);
+        #[derive(Clone, Debug)]
+        pub struct $key_id(String);
 
-        impl CacheKey for $key_id {
-            const PREFIX_CACHE: &'static str = $lit_prefix;
+        impl AsRef<str> for $key_id {
+            fn as_ref(&self) -> &str {
+                &self.0
+            }
         }
-    };
 
-    ($key_id:ident, $val_struct:ident) => {
-        crate::core::cache::string_kv_def_inner!($key_id, $val_struct);
+        impl StringValue for $val_struct {
+            type Key = $key_id;
+        }
 
-        impl CacheKey for $key_id {}
+        impl Key for $key_id {
+            const KEY_PREFIX: &'static str = $lit_prefix;
+        }
     };
 }
 #[allow(unused_imports)]
 pub(crate) use string_kv_def;
-
-#[derive(Clone)]
-#[enum_dispatch]
-pub enum Cache {
-    MemoryCache(memory::MemoryCache),
-    RedisCache(redis::RedisCache),
-    None(none::NoCache),
-}
-
-impl Cache {
-    pub fn is_none(&self) -> bool {
-        matches!(*self, Cache::None(none::NoCache))
-    }
-}
 
 const RETRY_SCHEDULE: &[Duration] = &[
     Duration::from_millis(10),
@@ -153,10 +115,18 @@ const RETRY_SCHEDULE: &[Duration] = &[
 ];
 
 #[async_trait]
-#[enum_dispatch(Cache)]
-pub trait CacheBehavior: Sync + Send {
-    fn should_retry(&self, e: &Error) -> bool;
-    async fn get<T: CacheValue>(&self, key: &T::Key) -> Result<Option<T>> {
+#[enum_dispatch]
+pub trait KvBackend: Sync + Send {
+    fn should_retry(&self, e: &crate::core::kv_backend::Error) -> bool;
+
+    // NOTE: The fully expanded types (`std::result::Result<_, crate::core::kv_backend::Error>`) are
+    // because the `enum_dispatch` crate expands based on these defintions. So they have to be expanded
+    // for the macro to be sanitized.
+
+    async fn get<T: Value>(
+        &self,
+        key: &T::Key,
+    ) -> std::result::Result<Option<T>, crate::core::kv_backend::Error> {
         run_with_retries(
             || async move {
                 self.get_raw(key.as_ref().as_bytes())
@@ -174,9 +144,15 @@ pub trait CacheBehavior: Sync + Send {
         .await
     }
 
-    async fn get_raw(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
+    async fn get_raw(
+        &self,
+        key: &[u8],
+    ) -> std::result::Result<Option<Vec<u8>>, crate::core::kv_backend::Error>;
 
-    async fn get_string<T: StringCacheValue>(&self, key: &T::Key) -> Result<Option<T>> {
+    async fn get_string<T: StringValue>(
+        &self,
+        key: &T::Key,
+    ) -> std::result::Result<Option<T>, crate::core::kv_backend::Error> {
         run_with_retries(
             || async move {
                 self.get_raw(key.as_ref().as_bytes())
@@ -194,7 +170,12 @@ pub trait CacheBehavior: Sync + Send {
         .await
     }
 
-    async fn set<T: CacheValue>(&self, key: &T::Key, value: &T, ttl: Duration) -> Result<()> {
+    async fn set<T: Value>(
+        &self,
+        key: &T::Key,
+        value: &T,
+        ttl: Duration,
+    ) -> std::result::Result<(), crate::core::kv_backend::Error> {
         run_with_retries(
             || async move {
                 self.set_raw(
@@ -210,14 +191,19 @@ pub trait CacheBehavior: Sync + Send {
         .await
     }
 
-    async fn set_raw(&self, key: &[u8], value: &[u8], ttl: Duration) -> Result<()>;
+    async fn set_raw(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        ttl: Duration,
+    ) -> std::result::Result<(), crate::core::kv_backend::Error>;
 
-    async fn set_string<T: StringCacheValue>(
+    async fn set_string<T: StringValue>(
         &self,
         key: &T::Key,
         value: &T,
         ttl: Duration,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), crate::core::kv_backend::Error> {
         run_with_retries(
             || async move {
                 self.set_raw(key.as_ref().as_bytes(), value.to_string().as_bytes(), ttl)
@@ -229,14 +215,17 @@ pub trait CacheBehavior: Sync + Send {
         .await
     }
 
-    async fn delete<T: CacheKey>(&self, key: &T) -> Result<()>;
+    async fn delete<T: Key>(
+        &self,
+        key: &T,
+    ) -> std::result::Result<(), crate::core::kv_backend::Error>;
 
-    async fn set_if_not_exists<T: CacheValue>(
+    async fn set_if_not_exists<T: Value>(
         &self,
         key: &T::Key,
         value: &T,
         ttl: Duration,
-    ) -> Result<bool> {
+    ) -> std::result::Result<bool, crate::core::kv_backend::Error> {
         run_with_retries(
             || async move {
                 self.set_raw_if_not_exists(
@@ -252,14 +241,19 @@ pub trait CacheBehavior: Sync + Send {
         .await
     }
 
-    async fn set_raw_if_not_exists(&self, key: &[u8], value: &[u8], ttl: Duration) -> Result<bool>;
+    async fn set_raw_if_not_exists(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        ttl: Duration,
+    ) -> std::result::Result<bool, crate::core::kv_backend::Error>;
 
-    async fn set_string_if_not_exists<T: StringCacheValue>(
+    async fn set_string_if_not_exists<T: StringValue>(
         &self,
         key: &T::Key,
         value: &T,
         ttl: Duration,
-    ) -> Result<bool> {
+    ) -> std::result::Result<bool, crate::core::kv_backend::Error> {
         run_with_retries(
             || async move {
                 self.set_raw_if_not_exists(

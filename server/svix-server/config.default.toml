@@ -65,8 +65,7 @@ queue_type = "redis"
 # What kind of cache to use. Supported: memory, redis, rediscluster, none.
 # Redis backends must have a redis_dsn or cache_dsn configured.
 # The memory backend is recommended if you only have one instance running (not including workers). If you have
-# multiple API servers running, please use the redis backend or some functionality, (e.g. Idempotency)
-# may fail to work correctly.
+# multiple API servers running, please use the redis backend or some cached items will not be mirrored.
 cache_type = "memory"
 
 # The DSN for the Redis-backed cache. Overrides `redis_dsn`. (can be left empty if not using redis)
